@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>MotorCredito.Carga</RootNamespace>
+    <!-- Ferramenta de linha de comando: o texto de saída é em português e fixo. -->
+    <NoWarn>$(NoWarn);CA1303;CA1031</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Reaproveita da API: conexões e tradução de erros dos bancos, validação de documentos e configuração. -->
+    <ProjectReference Include="..\MotorCredito.Api\MotorCredito.Api.csproj" />
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Os scripts SQL viajam dentro do programa: a ferramenta roda de qualquer pasta. -->
+    <EmbeddedResource Include="..\..\banco\**\*.sql" LogicalName="banco/%(RecursiveDir)%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>

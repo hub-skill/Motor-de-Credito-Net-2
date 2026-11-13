@@ -1,0 +1,48 @@
+# Kubernetes do Docker Desktop. Modo kubeadm: as imagens do docker build já ficam visíveis ao cluster.
+# Modo kind (nó "desktop-control-plane"): importe a imagem no nó antes (ver references/validacao-local.md).
+# Antes do primeiro dry-run no servidor:  kubectl apply -f k8s/overlays/local/namespace.yaml
+# Aplicar:  kubectl apply -k k8s/overlays/local
+# Acessar:  kubectl -n motor-credito-net-2 port-forward svc/motor-credito-net-2 8080:80   ->  http://localhost:8080
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: motor-credito-net-2
+resources:
+  - namespace.yaml
+  - ../../base
+
+# Configuração NÃO secreta. Copie config-python.env.example ou config-dotnet.env.example para config.env.
+configMapGenerator:
+  - name: motor-credito-net-2-config
+    envs: [config.env]
+
+# Segredos: arquivo local, NUNCA versionado (está no .gitignore e no .dockerignore). Só as variáveis que a
+# API usa (nada de *_ADMIN_*). O sufixo de hash gerado faz o Deployment reiniciar quando o segredo muda.
+secretGenerator:
+  - name: motor-credito-net-2-segredos
+    envs: [segredos.env]
+
+images:
+  - name: motor-credito-net-2
+    newTag: 0.1.0
+
+patches:
+  # Uma réplica e sem HPA (o Docker Desktop não traz metrics-server).
+  - target: {kind: Deployment, name: motor-credito-net-2}
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1
+  - target: {kind: HorizontalPodAutoscaler, name: motor-credito-net-2}
+    patch: |-
+      $patch: delete
+      apiVersion: autoscaling/v2
+      kind: HorizontalPodAutoscaler
+      metadata:
+        name: motor-credito-net-2
+  - target: {kind: PodDisruptionBudget, name: motor-credito-net-2}
+    patch: |-
+      $patch: delete
+      apiVersion: policy/v1
+      kind: PodDisruptionBudget
+      metadata:
+        name: motor-credito-net-2

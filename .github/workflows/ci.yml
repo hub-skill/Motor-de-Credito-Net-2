@@ -1,0 +1,31 @@
+# CI do Motor de Crédito .NET 2 (recriação de teste). Roda nas branches dev e staging e nos pull requests para elas.
+# Não roda os testes que precisam de PostgreSQL/Oracle reais (Categoria=Bancos): esses rodam na máquina de desenvolvimento.
+name: ci
+
+on:
+  push:
+    branches: [dev, staging]
+  pull_request:
+    branches: [dev, staging]
+
+permissions:
+  contents: read
+
+jobs:
+  build-e-testes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Formato
+        run: dotnet format MotorCredito.slnx --verify-no-changes
+      - name: Build (avisos são erros)
+        run: dotnet build MotorCredito.slnx -c Release
+      - name: Testes (sem os de banco real)
+        run: dotnet test MotorCredito.slnx -c Release --no-build --filter "Categoria!=Bancos"
+      - name: Pacotes vulneráveis (inclusive transitivos)
+        run: |
+          dotnet list MotorCredito.slnx package --vulnerable --include-transitive | tee vulneraveis.txt
+          ! grep -q "Crítico\|Critical\|Alto\|High\|Moderado\|Moderate\|Baixo\|Low" vulneraveis.txt

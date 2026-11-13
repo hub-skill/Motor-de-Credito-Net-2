@@ -1,0 +1,264 @@
+using System.Net;
+using System.Net.Http.Json;
+using System.Text;
+using System.Text.Json;
+using Xunit;
+using static MotorCredito.Api.IntegrationTests.ContratoDeErro;
+
+namespace MotorCredito.Api.IntegrationTests;
+
+/// <summary>
+/// Comportamentos genéricos da API, válidos para qualquer API gerada pela skill:
+/// formato dos erros, limites, timeout, health, cabeçalhos e documentação.
+/// Ao adaptar o template, troque só <see cref="Url"/> e <see cref="CorpoValido"/>.
+/// </summary>
+public sealed class ComportamentoDaApiTests(ApiFactory fabrica) : IClassFixture<ApiFactory>
+{
+    private const string Url = "/api/v1/triagem";
+    private static readonly object CorpoValido = new { documento = "52998224725" };
+
+    private HttpClient ClienteAutenticado(HttpClient? cliente = null)
+    {
+        cliente ??= fabrica.CreateClient();
+        cliente.DefaultRequestHeaders.Add("X-API-Key", ApiFactory.ChaveDeTeste);
+        return cliente;
+    }
+
+    private static async Task<string> TextoDoJson(HttpResponseMessage resposta)
+    {
+        using var documento = JsonDocument.Parse(await resposta.Content.ReadAsStringAsync());
+        return documento.RootElement.GetRawText();
+    }
+
+    [Fact]
+    public async Task Erro_401_tem_formato_padrao_e_www_authenticate()
+    {
+        var resposta = await fabrica.CreateClient().PostAsJsonAsync(Url, CorpoValido);
+
+        await AfirmarProblema(resposta, HttpStatusCode.Unauthorized, "http_401");
+        Assert.Equal("APIKey", resposta.Headers.WwwAuthenticate.ToString());
+    }
+
+    [Fact]
+    public async Task Rota_inexistente_401_sem_chave_e_404_com_chave()
+    {
+        // Sem chave não revela se a rota existe.
+        var semChave = await fabrica.CreateClient().GetAsync(new Uri("/nao-existe", UriKind.Relative));
+        await AfirmarProblema(semChave, HttpStatusCode.Unauthorized, "http_401");
+        Assert.Equal("APIKey", semChave.Headers.WwwAuthenticate.ToString());
+
+        var comChave = await ClienteAutenticado().GetAsync(new Uri("/nao-existe", UriKind.Relative));
+        await AfirmarProblema(comChave, HttpStatusCode.NotFound, "http_404");
+    }
+
+    [Fact]
+    public async Task Metodo_errado_401_sem_chave_e_405_com_chave()
+    {
+        var semChave = await fabrica.CreateClient().GetAsync(new Uri(Url, UriKind.Relative));
+        await AfirmarProblema(semChave, HttpStatusCode.Unauthorized, "http_401");
+
+        var comChave = await ClienteAutenticado().GetAsync(new Uri(Url, UriKind.Relative));
+        await AfirmarProblema(comChave, HttpStatusCode.MethodNotAllowed, "http_405");
+    }
+
+    [Fact]
+    public async Task Corpo_grande_demais_responde_413()
+    {
+        using var conteudo = new StringContent($"{{\"documento\": \"{new string('1', 70_000)}\"}}", Encoding.UTF8, "application/json");
+        var resposta = await ClienteAutenticado().PostAsync(Url, conteudo);
+
+        await AfirmarProblema(resposta, HttpStatusCode.RequestEntityTooLarge, "corpo_muito_grande");
+    }
+
+    [Fact]
+    public async Task Json_invalido_responde_400_e_nao_500()
+    {
+        // ApiFactory roda em Production: sem ThrowOnBadRequest=true este teste falharia (400 fora do formato).
+        using var conteudo = new StringContent("{nao e json", Encoding.UTF8, "application/json");
+        var resposta = await ClienteAutenticado().PostAsync(Url, conteudo);
+
+        await AfirmarProblema(resposta, HttpStatusCode.BadRequest, "requisicao_invalida");
+    }
+
+    [Fact]
+    public async Task Json_aninhado_fundo_demais_responde_400_e_nao_500()
+    {
+        // ~1 KB (abaixo do limite de corpo de 4 KB) num campo extra: o leitor percorre o valor e passa da profundidade máxima.
+        var corpo = "{\"documento\": \"52998224725\", \"extra\": " + string.Concat(Enumerable.Repeat("{\"a\": ", 150)) + "1" + new string('}', 151);
+        using var conteudo = new StringContent(corpo, Encoding.UTF8, "application/json");
+        var resposta = await ClienteAutenticado().PostAsync(Url, conteudo);
+
+        await AfirmarProblema(resposta, HttpStatusCode.BadRequest, "requisicao_invalida");
+    }
+
+    /// <summary>Corpo válido com um campo extra aninhado até <paramref name="niveis"/> no total (a raiz conta como 1).</summary>
+    private static string Aninhado(int niveis) =>
+        "{\"documento\": \"52998224725\", \"extra\": " + new string('[', niveis - 1) + new string(']', niveis - 1) + "}";
+
+    private async Task<HttpResponseMessage> EnviarJsonAsync(string corpo, bool comChave = true)
+    {
+        var cliente = comChave ? ClienteAutenticado() : fabrica.CreateClient();
+        using var conteudo = new StringContent(corpo, Encoding.UTF8, "application/json");
+        return await cliente.PostAsync(new Uri(Url, UriKind.Relative), conteudo);
+    }
+
+    [Fact]
+    public async Task Json_ate_64_niveis_passa_e_acima_responde_400()
+    {
+        // Mesmo limite do template Python. Até 64 a profundidade não é motivo de recusa (campo extra é aceito e
+        // ignorado nesta API: 200). Colchetes dentro de textos não contam.
+        Assert.Equal(HttpStatusCode.OK, (await EnviarJsonAsync(Aninhado(64))).StatusCode);
+        Assert.Equal(HttpStatusCode.OK, (await EnviarJsonAsync("{\"documento\": \"52998224725\", \"nome\": \"" + new string('[', 100) + "\"}")).StatusCode);
+        await AfirmarProblema(await EnviarJsonAsync(Aninhado(65)), HttpStatusCode.BadRequest, "requisicao_invalida");
+    }
+
+    [Fact]
+    public async Task Utf8_invalido_responde_400()
+    {
+        using var conteudo = new ByteArrayContent([.. "{\"documento\": \"52998224725\", \"nome\": \"ol"u8, 0xFF, .. "\"}"u8]);
+        conteudo.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/json");
+        var resposta = await ClienteAutenticado().PostAsync(new Uri(Url, UriKind.Relative), conteudo);
+
+        await AfirmarProblema(resposta, HttpStatusCode.BadRequest, "requisicao_invalida");
+    }
+
+    [Fact]
+    public async Task Json_fundo_sem_chave_responde_401() =>
+        await AfirmarProblema(await EnviarJsonAsync(Aninhado(65), comChave: false), HttpStatusCode.Unauthorized, "http_401");
+
+    [Theory]
+    [InlineData("NaN")]
+    [InlineData("Infinity")]
+    [InlineData("-Infinity")]
+    public async Task Nan_e_infinity_respondem_400_como_json_malformado(string valor) =>
+        await AfirmarProblema(
+            await EnviarJsonAsync("{\"documento\": \"52998224725\", \"extra\": " + valor + "}"), HttpStatusCode.BadRequest, "requisicao_invalida");
+
+    [Theory]
+    [InlineData("{\"documento\": 1}")]
+    [InlineData("{\"documento\": \"52998224725\", \"nome\": 7}")]
+    [InlineData("[\"ola\"]")]
+    [InlineData("\"ola\"")]
+    [InlineData("{}")]
+    [InlineData("{\"documento\": null}")]
+    [InlineData("null")]
+    [InlineData("")]
+    public async Task Json_valido_com_forma_errada_responde_422(string corpo)
+    {
+        // Igual ao template Python: só o corpo ilegível é 400; JSON válido com forma errada é 422.
+        using var conteudo = new StringContent(corpo, Encoding.UTF8, "application/json");
+        var resposta = await ClienteAutenticado().PostAsync(Url, conteudo);
+
+        await AfirmarProblema(resposta, HttpStatusCode.UnprocessableEntity, "entrada_invalida");
+    }
+
+    [Theory]
+    [InlineData("sem_chave", 401)]
+    [InlineData("entrada_invalida", 422)]
+    [InlineData("rota_inexistente", 404)]
+    [InlineData("erro_inesperado", 500)]
+    public async Task Respostas_de_erro_levam_request_id_e_cabecalhos_de_seguranca(string chamada, int status)
+    {
+        // O tratador de exceções limpa os headers ao montar o erro: eles precisam ser definidos na hora de enviar.
+        using var comErro = new ApiFactoryConfiguravel(
+            new Dictionary<string, string>(), new ServicoFalso(lancar: new InvalidOperationException("falha")));
+        var resposta = chamada switch
+        {
+            "sem_chave" => await fabrica.CreateClient().PostAsJsonAsync(Url, CorpoValido),
+            "entrada_invalida" => await ClienteAutenticado().PostAsJsonAsync(Url, new { documento = "   " }),
+            "rota_inexistente" => await ClienteAutenticado().GetAsync(new Uri("/nao-existe", UriKind.Relative)),
+            _ => await ClienteAutenticado(comErro.CreateClient()).PostAsJsonAsync(Url, CorpoValido),
+        };
+
+        Assert.Equal(status, (int)resposta.StatusCode);
+        Assert.Equal("nosniff", resposta.Headers.GetValues("X-Content-Type-Options").Single());
+        Assert.Equal("DENY", resposta.Headers.GetValues("X-Frame-Options").Single());
+        Assert.Equal("no-store", resposta.Headers.CacheControl?.ToString());
+        using var corpo = JsonDocument.Parse(await resposta.Content.ReadAsStringAsync());
+        Assert.Equal(corpo.RootElement.GetProperty("request_id").GetString(), resposta.Headers.GetValues("X-Request-ID").Single());
+    }
+
+    [Fact]
+    public async Task Health_e_cabecalhos_de_seguranca()
+    {
+        var cliente = fabrica.CreateClient();
+        var vivo = await cliente.GetAsync(new Uri("/health/live", UriKind.Relative));
+        var pronto = await cliente.GetAsync(new Uri("/health/ready", UriKind.Relative));
+
+        Assert.Equal(HttpStatusCode.OK, vivo.StatusCode);
+        Assert.Equal(HttpStatusCode.OK, pronto.StatusCode);
+        Assert.Equal("""{"status":"ok"}""", await TextoDoJson(vivo));
+        Assert.Equal("""{"status":"ok","banco":"postgres"}""", await TextoDoJson(pronto));
+        Assert.Equal("nosniff", vivo.Headers.GetValues("X-Content-Type-Options").Single());
+        Assert.Equal("DENY", vivo.Headers.GetValues("X-Frame-Options").Single());
+        Assert.StartsWith("max-age=", vivo.Headers.GetValues("Strict-Transport-Security").Single(), StringComparison.Ordinal);
+        Assert.False(string.IsNullOrEmpty(vivo.Headers.GetValues("X-Request-ID").Single()));
+        Assert.Equal("no-store", vivo.Headers.CacheControl?.ToString());
+        Assert.Equal("no-store", pronto.Headers.CacheControl?.ToString());
+    }
+
+    [Fact]
+    public async Task Rate_limit_responde_429_com_retry_after()
+    {
+        using var limitada = new ApiFactoryConfiguravel(new Dictionary<string, string> { ["Api:RateLimitPorMinuto"] = "2" });
+        var cliente = ClienteAutenticado(limitada.CreateClient());
+
+        for (var i = 0; i < 2; i++)
+        {
+            Assert.Equal(HttpStatusCode.OK, (await cliente.PostAsJsonAsync(Url, CorpoValido)).StatusCode);
+        }
+
+        var bloqueada = await cliente.PostAsJsonAsync(Url, CorpoValido);
+        await AfirmarProblema(bloqueada, HttpStatusCode.TooManyRequests, "limite_excedido");
+        Assert.Equal("60", bloqueada.Headers.RetryAfter?.ToString());
+
+        // Com o limite estourado, health e métricas continuam respondendo: no Kubernetes as probes saem todas do
+        // IP do nó, e um 429 na liveness reiniciaria o pod.
+        foreach (var rota in new[] { "/health/live", "/health/ready", "/metrics" })
+        {
+            Assert.Equal(HttpStatusCode.OK, (await cliente.GetAsync(new Uri(rota, UriKind.Relative))).StatusCode);
+        }
+    }
+
+    [Fact]
+    public async Task Processamento_lento_responde_504()
+    {
+        using var lenta = new ApiFactoryConfiguravel(
+            new Dictionary<string, string> { ["Api:RequestTimeoutSeconds"] = "1" }, new ServicoFalso(atraso: TimeSpan.FromSeconds(3)));
+
+        var resposta = await ClienteAutenticado(lenta.CreateClient()).PostAsJsonAsync(Url, CorpoValido);
+
+        await AfirmarProblema(resposta, HttpStatusCode.GatewayTimeout, "timeout");
+    }
+
+    [Fact]
+    public async Task Erro_inesperado_responde_500_generico_sem_vazar_detalhes()
+    {
+        using var comErro = new ApiFactoryConfiguravel(
+            new Dictionary<string, string>(), new ServicoFalso(lancar: new InvalidOperationException("detalhe interno: senha=abc")));
+
+        var resposta = await ClienteAutenticado(comErro.CreateClient()).PostAsJsonAsync(Url, CorpoValido);
+        var texto = await resposta.Content.ReadAsStringAsync();
+
+        await AfirmarProblema(resposta, HttpStatusCode.InternalServerError, "erro_interno");
+        Assert.DoesNotContain("detalhe interno", texto, StringComparison.Ordinal);
+        Assert.DoesNotContain("InvalidOperationException", texto, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Documentacao_so_existe_quando_ligada_e_e_publica()
+    {
+        using var ligada = new ApiFactoryConfiguravel(new Dictionary<string, string> { ["Api:EnableDocs"] = "true" });
+        var openApi = await ligada.CreateClient().GetAsync(new Uri("/openapi/v1.json", UriKind.Relative));
+        var scalar = await ligada.CreateClient().GetAsync(new Uri("/scalar", UriKind.Relative));
+        Assert.Equal(HttpStatusCode.OK, openApi.StatusCode);
+        Assert.Contains(Url, await openApi.Content.ReadAsStringAsync(), StringComparison.Ordinal);
+        Assert.Equal(HttpStatusCode.OK, scalar.StatusCode);
+
+        // Desligada (padrão): com chave, a rota não existe; sem chave, 401.
+        var desligada = await ClienteAutenticado().GetAsync(new Uri("/openapi/v1.json", UriKind.Relative));
+        await AfirmarProblema(desligada, HttpStatusCode.NotFound, "http_404");
+        var semChave = await fabrica.CreateClient().GetAsync(new Uri("/openapi/v1.json", UriKind.Relative));
+        await AfirmarProblema(semChave, HttpStatusCode.Unauthorized, "http_401");
+    }
+}
